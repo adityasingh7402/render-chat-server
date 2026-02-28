@@ -1,0 +1,17 @@
+{
+    "name": "chat-server",
+    "version": "1.0.0",
+    "description": "Real-time SSE/long-poll server for Email Router live chat. Deploy to Render.com free tier.",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node server.js"
+    },
+    "dependencies": {
+        "cors": "^2.8.5",
+        "express": "^4.21.0"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}
