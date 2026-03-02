@@ -1,156 +1,221 @@
 /* =============================================================
-   render-chat-server/server.js
+   render-chat-server/server.js  v2.0  — Full WebSocket (Socket.io)
+
+   Rooms: each conversationId is a socket.io room.
    
-   Lightweight Express SSE push server.
-   Deploy only THIS FOLDER to Render.com free tier.
-   
-   Routes:
-     GET  /health          → 200 "OK"  (UptimeRobot pings this)
-     GET  /live?key=&cid=  → SSE stream, max 55s, heartbeat every 20s
-     POST /push            → Push agent reply to visitor SSE stream
+   CLIENT → SERVER events:
+     join            { key, cid, visitorId, role, secret? }
+     visitor_message { cid, message: { id, sender, body, type, mediaUrl, createdAt } }
+     agent_message   { cid, secret, message: { id, sender, body, type, mediaUrl, createdAt } }
+     typing_start    { cid, role }
+     typing_stop     { cid, role }
+
+   SERVER → CLIENT events:
+     new_message     { id, sender, body, type, mediaUrl, createdAt }
+     typing          { role, isTyping }
+     agent_status    { online: bool, count: number }   → sent to visitors in room
+     visitor_count   { count: number }                 → sent to agents in room
+     error           { message: string }
    ============================================================= */
 
 'use strict';
 
 const express = require('express');
-const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 const PUSH_SECRET = process.env.PUSH_SECRET || '';
 
-// ── Middleware ──────────────────────────────────────────────────
-app.use(cors({
-    origin: '*',            // visitors come from any domain
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'x-push-secret'],
-}));
-app.use(express.json());
+const io = new Server(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST'],
+    },
+    // Ping timeout/interval to keep Render free-tier alive
+    pingTimeout: 60000,
+    pingInterval: 25000,
+});
 
-// ── In-memory SSE client registry ──────────────────────────────
-// Map<conversationId, Set<{ key:string, res:Response }>>
-const clients = new Map();
+// ── In-memory room membership tracker ──────────────────────────
+// roomMembers: Map<cid, { agents: Set<socketId>, visitors: Set<socketId> }>
+const roomMembers = new Map();
 
-function addClient(conversationId, key, res) {
-    if (!clients.has(conversationId)) {
-        clients.set(conversationId, new Set());
+function getRoomMembers(cid) {
+    if (!roomMembers.has(cid)) {
+        roomMembers.set(cid, { agents: new Set(), visitors: new Set() });
     }
-    const entry = { key, res };
-    clients.get(conversationId).add(entry);
-    return entry;
+    return roomMembers.get(cid);
 }
 
-function removeClient(conversationId, entry) {
-    const set = clients.get(conversationId);
-    if (!set) return;
-    set.delete(entry);
-    if (set.size === 0) clients.delete(conversationId);
+function broadcastAgentStatus(cid) {
+    const members = getRoomMembers(cid);
+    const count = members.agents.size;
+    // Tell all visitors in this room the agent count
+    io.to(cid).emit('agent_status', { online: count > 0, count });
 }
 
-// ── Routes ──────────────────────────────────────────────────────
+function broadcastVisitorCount(cid) {
+    const members = getRoomMembers(cid);
+    const count = members.visitors.size;
+    // Tell all agents in this room the visitor count
+    io.to(cid).emit('visitor_count', { count });
+}
+
+// ── Socket.io connection handler ────────────────────────────────
+io.on('connection', (socket) => {
+
+    let currentCid = null;
+    let currentRole = null;
+
+    // ── join ──────────────────────────────────────────────
+    socket.on('join', ({ key, cid, visitorId, role, secret }) => {
+        if (!cid || !role) {
+            socket.emit('error', { message: 'cid and role are required' });
+            return;
+        }
+
+        // Agents must provide the PUSH_SECRET for auth
+        if (role === 'agent') {
+            if (!PUSH_SECRET || secret !== PUSH_SECRET) {
+                socket.emit('error', { message: 'Unauthorized' });
+                return;
+            }
+        }
+
+        currentCid = cid;
+        currentRole = role;
+
+        socket.join(cid);
+
+        const members = getRoomMembers(cid);
+        if (role === 'agent') {
+            members.agents.add(socket.id);
+        } else {
+            members.visitors.add(socket.id);
+        }
+
+        // Immediately push status to the newly joined client
+        broadcastAgentStatus(cid);
+        broadcastVisitorCount(cid);
+
+        console.log(`[ws] ${role} joined room ${cid} (socket ${socket.id})`);
+    });
+
+    // ── visitor_message ───────────────────────────────────
+    socket.on('visitor_message', ({ cid, message }) => {
+        if (!cid || !message) return;
+        // Broadcast to everyone in the room (including the sender for confirmation)
+        io.to(cid).emit('new_message', {
+            id: message.id,
+            sender: 'visitor',
+            body: message.body || '',
+            type: message.type || 'text',
+            mediaUrl: message.mediaUrl || '',
+            createdAt: message.createdAt || new Date().toISOString(),
+        });
+    });
+
+    // ── agent_message ─────────────────────────────────────
+    socket.on('agent_message', ({ cid, secret, message }) => {
+        if (!cid || !message) return;
+        if (!PUSH_SECRET || secret !== PUSH_SECRET) {
+            socket.emit('error', { message: 'Unauthorized' });
+            return;
+        }
+        io.to(cid).emit('new_message', {
+            id: message.id,
+            sender: 'agent',
+            body: message.body || '',
+            type: message.type || 'text',
+            mediaUrl: message.mediaUrl || '',
+            createdAt: message.createdAt || new Date().toISOString(),
+        });
+    });
+
+    // ── typing_start ──────────────────────────────────────
+    socket.on('typing_start', ({ cid, role }) => {
+        if (!cid) return;
+        socket.to(cid).emit('typing', { role, isTyping: true });
+    });
+
+    // ── typing_stop ───────────────────────────────────────
+    socket.on('typing_stop', ({ cid, role }) => {
+        if (!cid) return;
+        socket.to(cid).emit('typing', { role, isTyping: false });
+    });
+
+    // ── disconnect ────────────────────────────────────────
+    socket.on('disconnect', () => {
+        if (!currentCid) return;
+
+        const members = getRoomMembers(currentCid);
+        if (currentRole === 'agent') {
+            members.agents.delete(socket.id);
+        } else {
+            members.visitors.delete(socket.id);
+        }
+
+        // Clean up empty rooms
+        if (members.agents.size === 0 && members.visitors.size === 0) {
+            roomMembers.delete(currentCid);
+        } else {
+            broadcastAgentStatus(currentCid);
+            broadcastVisitorCount(currentCid);
+        }
+
+        console.log(`[ws] ${currentRole} left room ${currentCid} (socket ${socket.id})`);
+    });
+});
+
+// ── HTTP REST endpoints ─────────────────────────────────────────
+
+app.use(express.json());
 
 /**
  * GET /health
- * Used by UptimeRobot (or any pinger) to keep the free-tier instance awake.
+ * UptimeRobot pings this to keep the free-tier instance awake.
  */
 app.get('/health', (_req, res) => {
     res.status(200).send('OK');
 });
 
 /**
- * GET /live?key=&cid=
- * Opens an SSE stream for the given conversation.
- * - Sends a heartbeat comment every 20s to prevent Render/browser timeouts.
- * - Closes automatically after 55s (respects Render 60s idle limit).
- * - The embed page will reconnect automatically via EventSource retry.
- */
-app.get('/live', (req, res) => {
-    const { key, cid } = req.query;
-
-    if (!key || !cid) {
-        return res.status(400).json({ error: 'key and cid are required' });
-    }
-
-    // SSE headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // disable Nginx buffering on Render
-    res.flushHeaders();
-
-    // Send initial connection event
-    res.write('event: connected\ndata: {"ok":true}\n\n');
-
-    // Heartbeat every 20s (keeps the TCP connection alive)
-    const heartbeat = setInterval(() => {
-        res.write(': heartbeat\n\n');
-    }, 20000);
-
-    // Max lifetime: 55s — browser EventSource auto‑reconnects
-    const timeout = setTimeout(() => {
-        res.write('event: reconnect\ndata: {"reason":"timeout"}\n\n');
-        res.end();
-    }, 55000);
-
-    // Register client
-    const entry = addClient(cid, key, res);
-
-    // Cleanup on disconnect
-    req.on('close', () => {
-        clearInterval(heartbeat);
-        clearTimeout(timeout);
-        removeClient(cid, entry);
-        res.end();
-    });
-});
-
-/**
  * POST /push
- * Called by Vercel (the Next.js app) when an agent replies.
- * Body: { conversationId: string, message: { id, sender, body, createdAt } }
- * Header: x-push-secret must match PUSH_SECRET env var.
+ * Called by the Next.js server (agent reply API) to push a message
+ * to a visitor's socket room without the agent being in the socket room itself.
+ * Body: { conversationId, message: { id, sender, body, type, mediaUrl, createdAt } }
+ * Header: x-push-secret
  */
 app.post('/push', (req, res) => {
-    // Validate push secret
     const secret = req.headers['x-push-secret'];
     if (!PUSH_SECRET || secret !== PUSH_SECRET) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
     const { conversationId, message } = req.body;
-
     if (!conversationId || !message) {
         return res.status(400).json({ error: 'conversationId and message are required' });
     }
 
-    const set = clients.get(conversationId);
-    if (!set || set.size === 0) {
-        // No active SSE clients for this conversation — that's OK
-        return res.json({ delivered: 0, note: 'No active SSE clients for this conversation' });
-    }
+    io.to(conversationId).emit('new_message', {
+        id: message.id,
+        sender: message.sender || 'agent',
+        body: message.body || '',
+        type: message.type || 'text',
+        mediaUrl: message.mediaUrl || '',
+        createdAt: message.createdAt || new Date().toISOString(),
+    });
 
-    const payload = `data: ${JSON.stringify(message)}\n\n`;
-    let delivered = 0;
-
-    for (const entry of set) {
-        try {
-            entry.res.write(payload);
-            delivered++;
-        } catch {
-            // Client disconnected
-            set.delete(entry);
-        }
-    }
-
-    if (set.size === 0) clients.delete(conversationId);
-
-    return res.json({ delivered });
+    return res.json({ ok: true });
 });
 
-// ── Start server ────────────────────────────────────────────────
-app.listen(PORT, () => {
-    console.log(`[chat-server] Listening on port ${PORT}`);
+// ── Start ───────────────────────────────────────────────────────
+server.listen(PORT, () => {
+    console.log(`[chat-server v2] WebSocket + HTTP listening on port ${PORT}`);
     if (!PUSH_SECRET) {
-        console.warn('[chat-server] WARNING: PUSH_SECRET is not set. /push endpoint is insecure!');
+        console.warn('[chat-server] WARNING: PUSH_SECRET is not set!');
     }
 });
