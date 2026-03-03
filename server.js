@@ -141,7 +141,8 @@ io.on('connection', (socket) => {
     // ── visitor_message ───────────────────────────────────
     socket.on('visitor_message', ({ cid, message }) => {
         if (!cid || !message) return;
-        io.to(cid).emit('new_message', {
+        // Use socket.to() to exclude the sender (visitor already has it optimistically)
+        socket.to(cid).emit('new_message', {
             id: message.id,
             sender: 'visitor',
             body: message.body || '',
@@ -158,7 +159,8 @@ io.on('connection', (socket) => {
             socket.emit('error', { message: 'Unauthorized' });
             return;
         }
-        io.to(cid).emit('new_message', {
+        // Use socket.to() to exclude the sender (agent already has it optimistically)
+        socket.to(cid).emit('new_message', {
             id: message.id,
             sender: 'agent',
             body: message.body || '',
