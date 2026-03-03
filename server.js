@@ -1,21 +1,24 @@
 /* =============================================================
-   render-chat-server/server.js  v2.0  — Full WebSocket (Socket.io)
+   render-chat-server/server.js  v2.1  — Full WebSocket (Socket.io)
 
-   Rooms: each conversationId is a socket.io room.
-   
+   Rooms:
+     - conversationId room  → per-conversation messaging
+     - "presence:" + key    → widget-level presence so visitors without
+                              a cid still see agent online status
+
    CLIENT → SERVER events:
-     join            { key, cid, visitorId, role, secret? }
-     visitor_message { cid, message: { id, sender, body, type, mediaUrl, createdAt } }
-     agent_message   { cid, secret, message: { id, sender, body, type, mediaUrl, createdAt } }
-     typing_start    { cid, role }
-     typing_stop     { cid, role }
+     join             { key, cid?, visitorId, role, secret? }
+     visitor_message  { cid, message: { id, sender, body, type, mediaUrl, createdAt } }
+     agent_message    { cid, secret, message: { id, sender, body, type, mediaUrl, createdAt } }
+     typing_start     { cid, role }
+     typing_stop      { cid, role }
 
    SERVER → CLIENT events:
-     new_message     { id, sender, body, type, mediaUrl, createdAt }
-     typing          { role, isTyping }
-     agent_status    { online: bool, count: number }   → sent to visitors in room
-     visitor_count   { count: number }                 → sent to agents in room
-     error           { message: string }
+     new_message      { id, sender, body, type, mediaUrl, createdAt }
+     typing           { role, isTyping }
+     agent_status     { online: bool, count: number }   → sent to visitors
+     visitor_count    { count: number }                 → sent to agents
+     error            { message: string }
    ============================================================= */
 
 'use strict';
@@ -34,14 +37,16 @@ const io = new Server(server, {
         origin: '*',
         methods: ['GET', 'POST'],
     },
-    // Ping timeout/interval to keep Render free-tier alive
     pingTimeout: 60000,
     pingInterval: 25000,
 });
 
-// ── In-memory room membership tracker ──────────────────────────
+// ── In-memory trackers ──────────────────────────────────────────
 // roomMembers: Map<cid, { agents: Set<socketId>, visitors: Set<socketId> }>
 const roomMembers = new Map();
+
+// widgetAgents: Map<widgetKey, Set<socketId>>  — agents online per widget
+const widgetAgents = new Map();
 
 function getRoomMembers(cid) {
     if (!roomMembers.has(cid)) {
@@ -50,17 +55,26 @@ function getRoomMembers(cid) {
     return roomMembers.get(cid);
 }
 
-function broadcastAgentStatus(cid) {
+// Emit agent_status to everyone in the conversation room (visitors & agents)
+function broadcastAgentStatus(cid, key) {
     const members = getRoomMembers(cid);
-    const count = members.agents.size;
-    // Tell all visitors in this room the agent count
+    // Prefer the widget-level count if key is available, else fall back to room count
+    const count = key
+        ? (widgetAgents.get(key) || new Set()).size
+        : members.agents.size;
     io.to(cid).emit('agent_status', { online: count > 0, count });
+}
+
+// Emit agent_status to the widget presence room (visitors without a cid)
+function broadcastPresenceStatus(key) {
+    if (!key) return;
+    const count = (widgetAgents.get(key) || new Set()).size;
+    io.to('presence:' + key).emit('agent_status', { online: count > 0, count });
 }
 
 function broadcastVisitorCount(cid) {
     const members = getRoomMembers(cid);
     const count = members.visitors.size;
-    // Tell all agents in this room the visitor count
     io.to(cid).emit('visitor_count', { count });
 }
 
@@ -69,11 +83,12 @@ io.on('connection', (socket) => {
 
     let currentCid = null;
     let currentRole = null;
+    let currentKey = null;
 
     // ── join ──────────────────────────────────────────────
     socket.on('join', ({ key, cid, visitorId, role, secret }) => {
-        if (!cid || !role) {
-            socket.emit('error', { message: 'cid and role are required' });
+        if (!role) {
+            socket.emit('error', { message: 'role is required' });
             return;
         }
 
@@ -85,29 +100,47 @@ io.on('connection', (socket) => {
             }
         }
 
-        currentCid = cid;
         currentRole = role;
+        currentKey = key || null;
 
-        socket.join(cid);
-
-        const members = getRoomMembers(cid);
-        if (role === 'agent') {
-            members.agents.add(socket.id);
-        } else {
-            members.visitors.add(socket.id);
+        // ── Agents join the widget-level presence room ────
+        if (role === 'agent' && key) {
+            socket.join('presence:' + key);
+            if (!widgetAgents.has(key)) widgetAgents.set(key, new Set());
+            widgetAgents.get(key).add(socket.id);
+            // Immediately tell all visitors watching this widget that an agent is online
+            broadcastPresenceStatus(key);
         }
 
-        // Immediately push status to the newly joined client
-        broadcastAgentStatus(cid);
-        broadcastVisitorCount(cid);
+        // ── Join conversation room if cid is given ────────
+        if (cid) {
+            currentCid = cid;
+            socket.join(cid);
 
-        console.log(`[ws] ${role} joined room ${cid} (socket ${socket.id})`);
+            const members = getRoomMembers(cid);
+            if (role === 'agent') {
+                members.agents.add(socket.id);
+            } else {
+                members.visitors.add(socket.id);
+            }
+
+            // Tell the room about current agent/visitor counts
+            broadcastAgentStatus(cid, key);
+            broadcastVisitorCount(cid);
+        } else if (role === 'visitor' && key) {
+            // Visitor has no cid yet — join the presence room to get agent status
+            socket.join('presence:' + key);
+            // Tell this visitor immediately about agent status
+            const count = (widgetAgents.get(key) || new Set()).size;
+            socket.emit('agent_status', { online: count > 0, count });
+        }
+
+        console.log(`[ws] ${role} joined key=${key} cid=${cid || '(none)'} (socket ${socket.id})`);
     });
 
     // ── visitor_message ───────────────────────────────────
     socket.on('visitor_message', ({ cid, message }) => {
         if (!cid || !message) return;
-        // Broadcast to everyone in the room (including the sender for confirmation)
         io.to(cid).emit('new_message', {
             id: message.id,
             sender: 'visitor',
@@ -149,6 +182,16 @@ io.on('connection', (socket) => {
 
     // ── disconnect ────────────────────────────────────────
     socket.on('disconnect', () => {
+        // Remove from widget-level presence tracking
+        if (currentRole === 'agent' && currentKey) {
+            const agents = widgetAgents.get(currentKey);
+            if (agents) {
+                agents.delete(socket.id);
+                if (agents.size === 0) widgetAgents.delete(currentKey);
+            }
+            broadcastPresenceStatus(currentKey);
+        }
+
         if (!currentCid) return;
 
         const members = getRoomMembers(currentCid);
@@ -162,7 +205,7 @@ io.on('connection', (socket) => {
         if (members.agents.size === 0 && members.visitors.size === 0) {
             roomMembers.delete(currentCid);
         } else {
-            broadcastAgentStatus(currentCid);
+            broadcastAgentStatus(currentCid, currentKey);
             broadcastVisitorCount(currentCid);
         }
 
@@ -176,7 +219,6 @@ app.use(express.json());
 
 /**
  * GET /health
- * UptimeRobot pings this to keep the free-tier instance awake.
  */
 app.get('/health', (_req, res) => {
     res.status(200).send('OK');
@@ -184,8 +226,7 @@ app.get('/health', (_req, res) => {
 
 /**
  * POST /push
- * Called by the Next.js server (agent reply API) to push a message
- * to a visitor's socket room without the agent being in the socket room itself.
+ * Called by Next.js server to push a message into a socket room.
  * Body: { conversationId, message: { id, sender, body, type, mediaUrl, createdAt } }
  * Header: x-push-secret
  */
@@ -214,7 +255,7 @@ app.post('/push', (req, res) => {
 
 // ── Start ───────────────────────────────────────────────────────
 server.listen(PORT, () => {
-    console.log(`[chat-server v2] WebSocket + HTTP listening on port ${PORT}`);
+    console.log(`[chat-server v2.1] WebSocket + HTTP listening on port ${PORT}`);
     if (!PUSH_SECRET) {
         console.warn('[chat-server] WARNING: PUSH_SECRET is not set!');
     }
