@@ -138,6 +138,36 @@ io.on('connection', (socket) => {
         console.log(`[ws] ${role} joined key=${key} cid=${cid || '(none)'} (socket ${socket.id})`);
     });
 
+    // ── join_presence ─────────────────────────────────────────
+    // Allows an agent to register as "online" for multiple widgets
+    // at once, without joining any specific conversation room.
+    // Used by the dashboard-level AgentPresenceProvider.
+    socket.on('join_presence', ({ keys, secret }) => {
+        if (!secret || !PUSH_SECRET || secret !== PUSH_SECRET) {
+            socket.emit('error', { message: 'Unauthorized' });
+            return;
+        }
+
+        currentRole = 'agent';
+
+        if (!Array.isArray(keys) || keys.length === 0) return;
+
+        for (const key of keys) {
+            if (!key) continue;
+            // Track this key so disconnect cleanup works
+            if (!currentKey) currentKey = key; // store first key for backward compat
+            socket.join('presence:' + key);
+            if (!widgetAgents.has(key)) widgetAgents.set(key, new Set());
+            widgetAgents.get(key).add(socket.id);
+            broadcastPresenceStatus(key);
+        }
+
+        // Store all keys for cleanup on disconnect
+        socket._presenceKeys = keys.filter(Boolean);
+
+        console.log(`[ws] agent joined presence for ${keys.length} widget(s) (socket ${socket.id})`);
+    });
+
     // ── visitor_message ───────────────────────────────────
     socket.on('visitor_message', ({ cid, message }) => {
         if (!cid || !message) return;
@@ -184,7 +214,7 @@ io.on('connection', (socket) => {
 
     // ── disconnect ────────────────────────────────────────
     socket.on('disconnect', () => {
-        // Remove from widget-level presence tracking
+        // Remove from widget-level presence tracking (single-key join)
         if (currentRole === 'agent' && currentKey) {
             const agents = widgetAgents.get(currentKey);
             if (agents) {
@@ -192,6 +222,19 @@ io.on('connection', (socket) => {
                 if (agents.size === 0) widgetAgents.delete(currentKey);
             }
             broadcastPresenceStatus(currentKey);
+        }
+
+        // Remove from multi-key presence tracking (join_presence)
+        if (socket._presenceKeys) {
+            for (const key of socket._presenceKeys) {
+                if (key === currentKey) continue; // already handled above
+                const agents = widgetAgents.get(key);
+                if (agents) {
+                    agents.delete(socket.id);
+                    if (agents.size === 0) widgetAgents.delete(key);
+                }
+                broadcastPresenceStatus(key);
+            }
         }
 
         if (!currentCid) return;
