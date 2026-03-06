@@ -298,9 +298,29 @@ app.post('/push', (req, res) => {
     return res.json({ ok: true });
 });
 
+/**
+ * GET /presence?key=xxx
+ * Returns whether any agents are online for the given widget key.
+ * Used by visitor widget polling as a reliable alternative to socket-based presence.
+ */
+app.get('/presence', (req, res) => {
+    // Allow cross-origin requests from any origin (visitor widget is on a different domain)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
+
+    const key = req.query.key;
+    if (!key) {
+        return res.status(400).json({ error: 'key is required' });
+    }
+
+    const agents = widgetAgents.get(key);
+    const count = agents ? agents.size : 0;
+    return res.json({ online: count > 0, count });
+});
+
 // ── Start ───────────────────────────────────────────────────────
 server.listen(PORT, () => {
-    console.log(`[chat-server v2.1] WebSocket + HTTP listening on port ${PORT}`);
+    console.log(`[chat-server v2.2] WebSocket + HTTP listening on port ${PORT}`);
     if (!PUSH_SECRET) {
         console.warn('[chat-server] WARNING: PUSH_SECRET is not set!');
     }
