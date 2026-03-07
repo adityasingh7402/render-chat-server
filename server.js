@@ -281,19 +281,34 @@ app.post('/push', (req, res) => {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const { conversationId, message } = req.body;
+    const { conversationId, message, excludeSocketId } = req.body;
     if (!conversationId || !message) {
         return res.status(400).json({ error: 'conversationId and message are required' });
     }
 
-    io.to(conversationId).emit('new_message', {
+    const payload = {
         id: message.id,
         sender: message.sender || 'agent',
         body: message.body || '',
         type: message.type || 'text',
         mediaUrl: message.mediaUrl || '',
         createdAt: message.createdAt || new Date().toISOString(),
-    });
+    };
+
+    // If excludeSocketId is provided, broadcast to each socket individually
+    // so we can skip the sender (prevents duplicate delivery when client already
+    // shows the message optimistically via socket emit).
+    if (excludeSocketId) {
+        const room = io.sockets.adapter.rooms.get(conversationId);
+        if (room) {
+            for (const sockId of room) {
+                if (sockId === excludeSocketId) continue;
+                io.to(sockId).emit('new_message', payload);
+            }
+        }
+    } else {
+        io.to(conversationId).emit('new_message', payload);
+    }
 
     return res.json({ ok: true });
 });
